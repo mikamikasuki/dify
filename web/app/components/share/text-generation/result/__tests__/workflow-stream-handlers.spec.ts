@@ -211,12 +211,26 @@ describe('workflow state transformations', () => {
       rendered_content: 'Done',
     })
     expect(process.humanInputFormDataList?.map((form) => form.node_id)).toEqual(['node-2'])
+    process = updateHumanInputFilled(process, {
+      form_id: 'form-2',
+      action_id: 'submit',
+      action_text: 'Submit second form',
+      node_id: 'node-2',
+      node_title: 'Node 2',
+      rendered_content: 'Second form done',
+    })
+    expect(process.humanInputFormDataList).toEqual([])
     expect(process.humanInputFilledFormDataList).toEqual([
       expect.objectContaining({
         node_id: 'node-1',
         action_text: 'Submit',
         form_content: 'content',
         inputs: [],
+      }),
+      expect.objectContaining({
+        node_id: 'node-2',
+        action_text: 'Submit second form',
+        rendered_content: 'Second form done',
       }),
     ])
     const paused = applyWorkflowPaused(process)
@@ -230,7 +244,13 @@ describe('createWorkflowStreamHandlers', () => {
     vi.clearAllMocks()
   })
 
-  const setupHandlers = (overrides: { isPublicAPI?: boolean; isTimedOut?: () => boolean } = {}) => {
+  const setupHandlers = (
+    overrides: {
+      abortControllerRef?: { current: AbortController | null }
+      isPublicAPI?: boolean
+      isTimedOut?: () => boolean
+    } = {},
+  ) => {
     let completionRes = ''
     let currentTaskId: string | null = null
     let isStopping = false
@@ -263,6 +283,7 @@ describe('createWorkflowStreamHandlers', () => {
     const markEnded = vi.fn()
 
     const handlers = createWorkflowStreamHandlers({
+      abortControllerRef: overrides.abortControllerRef,
       getCompletionRes: () => completionRes,
       getWorkflowProcessData: () => workflowProcessData,
       isPublicAPI: overrides.isPublicAPI ?? false,
@@ -508,24 +529,206 @@ describe('createWorkflowStreamHandlers', () => {
   })
 
   it('should keep one resumable stream for installed apps', () => {
-    const { handlers } = setupHandlers({ isPublicAPI: false })
+    const abortControllerRef = { current: null as AbortController | null }
+    const { handlers } = setupHandlers({ abortControllerRef, isPublicAPI: false })
     const onWorkflowPaused = handlers.onWorkflowPaused!
+    const getAbortController = handlers.getAbortController!
+    const initialAbortController = new AbortController()
+    const resumeAbortController = new AbortController()
+    const initialAbortSpy = vi.spyOn(initialAbortController, 'abort')
+    const resumeAbortSpy = vi.spyOn(resumeAbortController, 'abort')
     const pausedEvent: Parameters<typeof onWorkflowPaused>[0] = {
       task_id: 'task-installed',
       workflow_run_id: 'run-installed',
       event: 'workflow_paused',
       data: { workflow_run_id: 'run-installed', outputs: {}, paused_nodes: [], reasons: [] },
     }
+    sseGetMock.mockImplementationOnce((_url, _fetchOptions, options) => {
+      options.getAbortController?.(resumeAbortController)
+    })
 
+    getAbortController(initialAbortController)
     onWorkflowPaused(pausedEvent)
     onWorkflowPaused(pausedEvent)
 
+    expect(initialAbortSpy).toHaveBeenCalledTimes(1)
+    expect(resumeAbortSpy).not.toHaveBeenCalled()
+    expect(abortControllerRef.current).toBe(resumeAbortController)
     expect(sseGetMock).toHaveBeenCalledWith(
       '/workflow/run-installed/events?include_state_snapshot=true&continue_on_pause=true',
       {},
       expect.objectContaining({ isPublicAPI: false }),
     )
     expect(sseGetMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('should abort the active workflow stream before opening resume SSE on pause', () => {
+    const abortControllerRef = { current: null as AbortController | null }
+    const setup = setupHandlers({ isPublicAPI: true, abortControllerRef })
+    const handlers = setup.handlers as Required<
+      Pick<IOtherOptions, 'getAbortController' | 'onWorkflowPaused'>
+    >
+    const initialAbortController = new AbortController()
+    const resumeAbortController = new AbortController()
+    const abortSpy = vi.spyOn(initialAbortController, 'abort')
+    sseGetMock.mockImplementationOnce((_url, _fetchOptions, options) => {
+      options.getAbortController?.(resumeAbortController)
+    })
+
+    act(() => {
+      handlers.getAbortController(initialAbortController)
+      handlers.onWorkflowPaused({
+        task_id: 'task-1',
+        workflow_run_id: 'run-1',
+        event: 'workflow_paused',
+        data: {
+          outputs: {},
+          paused_nodes: [],
+          reasons: [],
+          workflow_run_id: 'run-1',
+        },
+      })
+    })
+
+    expect(abortSpy).toHaveBeenCalledTimes(1)
+    expect(abortSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      sseGetMock.mock.invocationCallOrder[0]!,
+    )
+    expect(abortControllerRef.current).toBe(resumeAbortController)
+    expect(sseGetMock).toHaveBeenCalledWith(
+      '/workflow/run-1/events?include_state_snapshot=true&continue_on_pause=true',
+      {},
+      expect.objectContaining({ isPublicAPI: true }),
+    )
+  })
+
+  it('should ignore a stale stopped event from the initial stream after pause', () => {
+    const setup = setupHandlers()
+    const handlers = setup.handlers as Required<
+      Pick<IOtherOptions, 'onWorkflowPaused' | 'onWorkflowFinished'>
+    >
+
+    act(() => {
+      handlers.onWorkflowPaused({
+        task_id: 'task-1',
+        workflow_run_id: 'run-1',
+        event: 'workflow_paused',
+        data: {
+          outputs: {},
+          paused_nodes: [],
+          reasons: [],
+          workflow_run_id: 'run-1',
+        },
+      })
+      handlers.onWorkflowFinished({
+        task_id: 'task-1',
+        workflow_run_id: 'run-1',
+        event: 'workflow_finished',
+        data: {
+          id: 'run-1',
+          workflow_id: 'wf-1',
+          status: WorkflowRunningStatus.Stopped,
+          outputs: null,
+          error: '',
+          elapsed_time: 0,
+          total_tokens: 0,
+          total_steps: 0,
+          created_at: 0,
+          created_by: {
+            id: 'user-1',
+            name: 'User',
+            email: 'user@example.com',
+          },
+          finished_at: 0,
+        },
+      })
+    })
+
+    expect(setup.workflowProcessData()).toEqual(
+      expect.objectContaining({ status: WorkflowRunningStatus.Paused }),
+    )
+    expect(setup.onCompleted).not.toHaveBeenCalled()
+    expect(setup.setRespondingFalse).not.toHaveBeenCalled()
+  })
+
+  it('should process a stopped event from the resumed stream', () => {
+    const setup = setupHandlers()
+    const handlers = setup.handlers as Required<Pick<IOtherOptions, 'onWorkflowPaused'>>
+    const stoppedEvent: Parameters<NonNullable<IOtherOptions['onWorkflowFinished']>>[0] = {
+      task_id: 'task-1',
+      workflow_run_id: 'run-1',
+      event: 'workflow_finished',
+      data: {
+        id: 'run-1',
+        workflow_id: 'wf-1',
+        status: WorkflowRunningStatus.Stopped,
+        outputs: null,
+        error: '',
+        elapsed_time: 0,
+        total_tokens: 0,
+        total_steps: 0,
+        created_at: 0,
+        created_by: {
+          id: 'user-1',
+          name: 'User',
+          email: 'user@example.com',
+        },
+        finished_at: 0,
+      },
+    }
+
+    handlers.onWorkflowPaused({
+      task_id: 'task-1',
+      workflow_run_id: 'run-1',
+      event: 'workflow_paused',
+      data: {
+        outputs: {},
+        paused_nodes: [],
+        reasons: [],
+        workflow_run_id: 'run-1',
+      },
+    })
+
+    const resumeOptions = sseGetMock.mock.calls[0]![2] as IOtherOptions
+    resumeOptions.onWorkflowFinished?.(stoppedEvent)
+
+    expect(setup.workflowProcessData()).toEqual(
+      expect.objectContaining({ status: WorkflowRunningStatus.Stopped }),
+    )
+    expect(setup.onCompleted).toHaveBeenCalledWith('', 3, false)
+    expect(setup.setRespondingFalse).toHaveBeenCalled()
+  })
+
+  it('falls back when workflow outputs cannot be JSON-stringified', () => {
+    const setup = setupHandlers()
+    const handlers = setup.handlers as Required<Pick<IOtherOptions, 'onWorkflowFinished'>>
+    const outputs: Record<string, unknown> = {}
+    outputs.self = outputs
+
+    handlers.onWorkflowFinished({
+      task_id: 'task-1',
+      workflow_run_id: 'run-1',
+      event: 'workflow_finished',
+      data: {
+        id: 'run-1',
+        workflow_id: 'wf-1',
+        status: WorkflowRunningStatus.Succeeded,
+        outputs,
+        error: '',
+        elapsed_time: 0,
+        total_tokens: 0,
+        total_steps: 0,
+        created_at: 0,
+        created_by: {
+          id: 'user-1',
+          name: 'User',
+          email: 'user@example.com',
+        },
+        finished_at: 0,
+      },
+    })
+
+    expect(setup.setCompletionRes).toHaveBeenCalledWith('[object Object]')
   })
 
   it('should finish timed-out workflow state and warn without applying late outputs', () => {

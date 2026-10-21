@@ -1,4 +1,4 @@
-import type { Dispatch, SetStateAction } from 'react'
+import type { Dispatch, RefObject, SetStateAction } from 'react'
 import type { TextGenerationTranslate } from '../types'
 import type { WorkflowProcess } from '@/app/components/base/chat/types'
 import type { IOtherOptions } from '@/service/base'
@@ -19,6 +19,7 @@ import { sseGet } from '@/service/base'
 
 type Notify = (payload: { type: 'error' | 'warning'; message: string }) => void
 type CreateWorkflowStreamHandlersParams = {
+  abortControllerRef?: RefObject<AbortController | null>
   getCompletionRes: () => string
   getWorkflowProcessData: () => WorkflowProcess | undefined
   isPublicAPI: boolean
@@ -244,6 +245,7 @@ const serializeWorkflowOutputs = (outputs: WorkflowFinishedResponse['data']['out
 }
 
 export const createWorkflowStreamHandlers = ({
+  abortControllerRef,
   getCompletionRes,
   getWorkflowProcessData,
   isPublicAPI,
@@ -262,6 +264,19 @@ export const createWorkflowStreamHandlers = ({
   taskId,
 }: CreateWorkflowStreamHandlersParams): IOtherOptions => {
   let tempMessageId = ''
+  let workflowEventsAbortController: AbortController | null = null
+
+  const setActiveAbortController = (abortController: AbortController) => {
+    workflowEventsAbortController = abortController
+    if (abortControllerRef) abortControllerRef.current = abortController
+  }
+
+  const abortActiveWorkflowStream = () => {
+    const activeController = workflowEventsAbortController ?? abortControllerRef?.current ?? null
+    activeController?.abort()
+    workflowEventsAbortController = null
+    if (abortControllerRef) abortControllerRef.current = null
+  }
   let hasStartedResumeStream = false
 
   const finishWithFailure = () => {
@@ -279,8 +294,84 @@ export const createWorkflowStreamHandlers = ({
     markEnded()
   }
 
+  const handleWorkflowFinished = (
+    event: Parameters<NonNullable<IOtherOptions['onWorkflowFinished']>>[0],
+    ignoreStaleStoppedEvent: boolean,
+  ) => {
+    const { data } = event
+    const workflowStatus = data.status as WorkflowRunningStatus | undefined
+    if (
+      ignoreStaleStoppedEvent &&
+      workflowStatus === WorkflowRunningStatus.Stopped &&
+      getWorkflowProcessData()?.status === WorkflowRunningStatus.Paused
+    )
+      return
+
+    if (isTimedOut()) {
+      const finishedStatus =
+        workflowStatus === WorkflowRunningStatus.Stopped
+          ? WorkflowRunningStatus.Stopped
+          : workflowStatus === WorkflowRunningStatus.Failed || data.error
+            ? WorkflowRunningStatus.Failed
+            : WorkflowRunningStatus.Succeeded
+      setWorkflowProcessData(
+        applyWorkflowFinishedState(getWorkflowProcessData(), finishedStatus, data.error),
+      )
+      notify({
+        type: 'warning',
+        message: t(($) => $['warningMessage.timeoutExceeded'], { ns: 'appDebug' }),
+      })
+      markEnded()
+      return
+    }
+
+    if (workflowStatus === WorkflowRunningStatus.Stopped) {
+      setWorkflowProcessData(
+        applyWorkflowFinishedState(
+          getWorkflowProcessData(),
+          WorkflowRunningStatus.Stopped,
+          data.error,
+        ),
+      )
+      finishWithFailure()
+      return
+    }
+
+    if (data.error) {
+      notify({ type: 'error', message: data.error })
+      setWorkflowProcessData(
+        applyWorkflowFinishedState(
+          getWorkflowProcessData(),
+          WorkflowRunningStatus.Failed,
+          data.error,
+        ),
+      )
+      finishWithFailure()
+      return
+    }
+
+    setWorkflowProcessData(applyWorkflowOutputs(getWorkflowProcessData(), data.outputs))
+    const serializedOutputs = serializeWorkflowOutputs(data.outputs)
+    setCompletionRes(serializedOutputs)
+    if (data.outputs) {
+      const outputKeys = Object.keys(data.outputs)
+      const isStringOutput =
+        outputKeys.length === 1 && typeof data.outputs[outputKeys[0]!] === 'string'
+      if (isStringOutput) {
+        setWorkflowProcessData(
+          updateWorkflowProcess(getWorkflowProcessData(), (draft) => {
+            draft.resultText = data.outputs[outputKeys[0]!]
+          }),
+        )
+      }
+    }
+
+    finishWithSuccess()
+  }
+
   const otherOptions: IOtherOptions = {
     isPublicAPI,
+    getAbortController: setActiveAbortController,
     onWorkflowStarted: ({ workflow_run_id, task_id }) => {
       const workflowProcessData = getWorkflowProcessData()
       if (workflowProcessData?.tracing.length) {
@@ -323,69 +414,7 @@ export const createWorkflowStreamHandlers = ({
     onNodeFinished: ({ data }) => {
       setWorkflowProcessData(finishWorkflowNode(getWorkflowProcessData(), data))
     },
-    onWorkflowFinished: ({ data }) => {
-      const workflowStatus = data.status as WorkflowRunningStatus | undefined
-      if (isTimedOut()) {
-        const finishedStatus =
-          workflowStatus === WorkflowRunningStatus.Stopped
-            ? WorkflowRunningStatus.Stopped
-            : workflowStatus === WorkflowRunningStatus.Failed || data.error
-              ? WorkflowRunningStatus.Failed
-              : WorkflowRunningStatus.Succeeded
-        setWorkflowProcessData(
-          applyWorkflowFinishedState(getWorkflowProcessData(), finishedStatus, data.error),
-        )
-        notify({
-          type: 'warning',
-          message: t(($) => $['warningMessage.timeoutExceeded'], { ns: 'appDebug' }),
-        })
-        markEnded()
-        return
-      }
-
-      if (workflowStatus === WorkflowRunningStatus.Stopped) {
-        setWorkflowProcessData(
-          applyWorkflowFinishedState(
-            getWorkflowProcessData(),
-            WorkflowRunningStatus.Stopped,
-            data.error,
-          ),
-        )
-        finishWithFailure()
-        return
-      }
-
-      if (data.error) {
-        notify({ type: 'error', message: data.error })
-        setWorkflowProcessData(
-          applyWorkflowFinishedState(
-            getWorkflowProcessData(),
-            WorkflowRunningStatus.Failed,
-            data.error,
-          ),
-        )
-        finishWithFailure()
-        return
-      }
-
-      setWorkflowProcessData(applyWorkflowOutputs(getWorkflowProcessData(), data.outputs))
-      const serializedOutputs = serializeWorkflowOutputs(data.outputs)
-      setCompletionRes(serializedOutputs)
-      if (data.outputs) {
-        const outputKeys = Object.keys(data.outputs)
-        const isStringOutput =
-          outputKeys.length === 1 && typeof data.outputs[outputKeys[0]!] === 'string'
-        if (isStringOutput) {
-          setWorkflowProcessData(
-            updateWorkflowProcess(getWorkflowProcessData(), (draft) => {
-              draft.resultText = data.outputs[outputKeys[0]!]
-            }),
-          )
-        }
-      }
-
-      finishWithSuccess()
-    },
+    onWorkflowFinished: (event) => handleWorkflowFinished(event, true),
     onTextChunk: ({ data: { text } }) => {
       setWorkflowProcessData(appendResultText(getWorkflowProcessData(), text))
     },
@@ -405,10 +434,14 @@ export const createWorkflowStreamHandlers = ({
       tempMessageId = data.workflow_run_id
       if (!hasStartedResumeStream) {
         hasStartedResumeStream = true
+        abortActiveWorkflowStream()
         void sseGet(
           `/workflow/${data.workflow_run_id}/events?include_state_snapshot=true&continue_on_pause=true`,
           {},
-          otherOptions,
+          {
+            ...otherOptions,
+            onWorkflowFinished: (event) => handleWorkflowFinished(event, false),
+          },
         )
       }
       setWorkflowProcessData(applyWorkflowPaused(getWorkflowProcessData()))
