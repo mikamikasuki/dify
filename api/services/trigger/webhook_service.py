@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import mimetypes
 import secrets
 from collections.abc import Callable, Mapping, Sequence
@@ -775,10 +776,9 @@ class WebhookService:
 
     @classmethod
     def _can_convert_to_number(cls, value: str) -> bool:
-        """Check if a string can be converted to a number."""
+        """Check if a string can be converted to a finite number."""
         try:
-            float(value)
-            return True
+            return math.isfinite(float(value))
         except ValueError:
             return False
 
