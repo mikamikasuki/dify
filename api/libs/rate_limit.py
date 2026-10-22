@@ -60,7 +60,12 @@ def _one_key(scope: RateLimitScope) -> str:
         case RateLimitScope.IP:
             return f"ip:{extract_remote_ip(request) or 'unknown'}"
         case RateLimitScope.SESSION:
-            return f"session:{session.get('_id', 'anon')}"
+            # Flask-Login writes ``_id`` only on login_user(); console requests without it would
+            # otherwise all share one bucket, so fall back to the client address.
+            session_id = session.get("_id")
+            if session_id:
+                return f"session:{session_id}"
+            return f"session:ip:{extract_remote_ip(request) or 'unknown'}"
         case RateLimitScope.ACCOUNT:
             from libs.oauth_bearer import try_get_auth_ctx
 
