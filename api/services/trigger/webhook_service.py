@@ -306,7 +306,7 @@ class WebhookService:
                 - files_data: Empty dict (JSON requests don't contain files)
 
         Raises:
-            ValueError: If JSON parsing fails
+            ValueError: If JSON parsing fails or the body is not a JSON object
         """
         raw_body = request.get_data(cache=True)
         if not raw_body or raw_body.strip() == b"":
@@ -317,6 +317,8 @@ class WebhookService:
         except orjson.JSONDecodeError as exc:
             logger.warning("Failed to parse JSON body: %s", exc)
             raise ValueError(f"Invalid JSON body: {exc}") from exc
+        if not isinstance(body, dict):
+            raise ValueError("JSON body must be an object")
         return body, {}
 
     @classmethod

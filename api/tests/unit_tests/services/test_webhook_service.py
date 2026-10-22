@@ -497,6 +497,18 @@ class TestWebhookServiceUnit:
             with pytest.raises(ValueError, match="Invalid JSON body"):
                 WebhookService.extract_webhook_data(webhook_trigger)
 
+    def test_extract_webhook_data_rejects_non_object_json(self):
+        """A JSON body that is not an object is rejected as a bad request, not an internal error."""
+        app = Flask(__name__)
+
+        for payload in ("[1, 2]", "null", '"text"'):
+            with app.test_request_context(
+                "/webhook", method="POST", headers={"Content-Type": "application/json"}, data=payload
+            ):
+                webhook_trigger = _webhook_trigger()
+                with pytest.raises(ValueError, match="JSON body must be an object"):
+                    WebhookService.extract_webhook_data(webhook_trigger)
+
     def test_generate_webhook_response_default(self):
         """Test webhook response generation with default values."""
         node_config = {"data": {}}
