@@ -328,3 +328,13 @@ def test_invoke_skips_forwarding_outside_enterprise_edition(config_overrides):
                         with contextlib.suppress(Exception):
                             tool.invoke_remote_mcp_tool({}, user_id=None, app_id=None)
         inject.assert_not_called()
+
+
+@pytest.mark.parametrize("sqlite_session", [()], indirect=True)
+def test_mcp_tool_invoke_raises_when_server_reports_tool_error(sqlite_session: Session):
+    tool = _build_mcp_tool()
+    result = CallToolResult(content=[TextContent(type="text", text="division by zero")], isError=True)
+
+    with patch.object(MCPTool, "invoke_remote_mcp_tool", return_value=result):
+        with pytest.raises(ToolInvokeError, match="division by zero"):
+            list(tool.invoke(session=sqlite_session, user_id="user-1", tool_parameters={}))

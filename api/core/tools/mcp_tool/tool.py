@@ -98,6 +98,11 @@ class MCPTool(Tool):
         # Extract usage metadata from MCP protocol's _meta field
         self._latest_usage = self._derive_usage_from_result(result)
 
+        # MCP reports tool execution failures in-band via isError; surface them as failures
+        if result.isError:
+            error_text = "\n".join(content.text for content in result.content if isinstance(content, TextContent))
+            raise ToolInvokeError(error_text or "MCP tool reported an error")
+
         # handle dify tool output
         for content in result.content:
             match content:
